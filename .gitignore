@@ -1,0 +1,3 @@
+.env
+__pycache__/
+.bedrock_venv
