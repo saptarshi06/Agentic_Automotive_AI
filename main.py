@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
-from common.llm.base_bedrock import BedrockClient, AuthenticationExpiredError
+from common.llm.base_bedrock import GeminiClient, GeminiClientError
 from common.llm.business_analyst import (
     build_business_analyst_graph,
     BusinessAnalysisState,
@@ -20,7 +20,7 @@ load_dotenv()
 logger = logging.getLogger("server")
 
 
-client: Optional[BedrockClient] = None
+client: Optional[GeminiClient] = None
 graph = None
 
 
@@ -30,13 +30,13 @@ async def lifespan(app: FastAPI):
     global client, graph
 
     provider_data = {}
-    if os.getenv("AWS_BEARER_TOKEN_BEDROCK"):
-        provider_data["aws_bearer_token_bedrock"] = os.environ["AWS_BEARER_TOKEN_BEDROCK"]
+    # if os.getenv("AWS_BEARER_TOKEN_BEDROCK"):
+    #     provider_data["aws_bearer_token_bedrock"] = os.environ["AWS_BEARER_TOKEN_BEDROCK"]
 
     try:
-        client = BedrockClient(
+        client = GeminiClient(
             base_url=os.getenv("LLAMA_STACK_URL", "http://localhost:8321"),
-            provider_data=provider_data,
+            gemini_api_key=os.getenv("GEMINI_API_KEY"),
         )
         # Register shields
         await client.register_shields([BUSINESS_ANALYSIS_SHIELD])
@@ -89,7 +89,7 @@ async def analyze_endpoint(request: AnalysisRequest):
 
     try:
         final_state = await graph.ainvoke(initial_state)
-    except AuthenticationExpiredError:
+    except GeminiClientError:
         raise HTTPException(status_code=401, detail="AWS Bedrock token expired. Please refresh.")
     except Exception as e:
         logger.exception("Unexpected agent error")
