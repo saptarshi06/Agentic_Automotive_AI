@@ -1,173 +1,252 @@
 import asyncio
-import os
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
-import requests
+import aiohttp
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from common.llm.base_bedrock import GeminiClient, GeminiClientError
-from common.llm.business_analyst import (
-    build_business_analyst_graph,
-    BusinessAnalysisState,
-)
-from common.shields.agent_shields import BUSINESS_ANALYSIS_SHIELD
+from common.llm.business_analyst import BusinessAnalystAgent
+from common.llm.ollama_client import OllamaClient
+from common.mcp.mcp_engine import MCPEngine
 
 load_dotenv()
-logger = logging.getLogger("server")
+logger = logging.getLogger("auto_business_analyst")
+
+agent: Optional[BusinessAnalystAgent] = None
+mcp_client_wrapper: Optional[object] = None
 
 
-client: Optional[GeminiClient] = None
-graph = None
+# ... (imports remain the same)
+
+class MCPToolClient:
+    """Wrapper around MultiServerMCPClient to provide a call_tool method."""
+    def __init__(self, client):
+        self._client = client
+
+    async def call_tool(self, tool_name: str, arguments: dict):
+        """Call a tool via the underlying MultiServerMCPClient."""
+        # The client's call_tool method expects the server name prefix?
+        # Assuming tool_name includes server prefix (e.g., "github_...").
+        # We'll just call directly.
+        try:
+            return await self._client.call_tool(tool_name, arguments)
+        except Exception as e:
+            logger.error(f"Tool call failed for {tool_name}: {e}")
+            return {"status": "error", "message": str(e)}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialise Bedrock client, register shields, compile the agent graph."""
-    global client, graph
+    """Initialise the Business Analyst Agent with MCP tools (if available)."""
+    global agent, mcp_client_wrapper
 
-    provider_data = {}
-    # if os.getenv("AWS_BEARER_TOKEN_BEDROCK"):
-    #     provider_data["aws_bearer_token_bedrock"] = os.environ["AWS_BEARER_TOKEN_BEDROCK"]
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+    model = os.getenv("OLLAMA_MODEL", "phi3.5:latest")
 
-    try:
-        client = GeminiClient(
-            base_url=os.getenv("LLAMA_STACK_URL", "http://localhost:8321"),
-            gemini_api_key=os.getenv("GEMINI_API_KEY"),
-        )
-        # Register shields
-        await client.register_shields([BUSINESS_ANALYSIS_SHIELD])
-        # Compile the business analyst graph
-        graph = build_business_analyst_graph(client)
-        logger.info("Application started successfully.")
-    except Exception as e:
-        logger.error(f"Failed to initialise Bedrock client: {e}")
-        client = None
-        graph = None
+    agent = BusinessAnalystAgent(base_url=ollama_base_url, model=model)
 
-    yield  # server runs here
+    # MCP tool loading (only if ENABLE_MCP is true)
+    tool_definitions = None
+    mcp_client_wrapper = None
+    if os.getenv("ENABLE_MCP", "false").lower() == "true":
+        try:
+            from langchain_mcp_adapters.client import MultiServerMCPClient
+            from common.mcp.config import MCPServerConfig
 
-    client = None
-    graph = None
+            server_configs = MCPServerConfig.get_server_configs()
+            # Create client without context manager (new API)
+            client = MultiServerMCPClient(server_configs, tool_name_prefix=True)
+            # Get tools – this connects automatically
+            discovered_tools = await asyncio.wait_for(client.get_tools(), timeout=30)
+            if discovered_tools:
+                tool_definitions = OllamaClient.convert_langchain_tools_to_openai(discovered_tools)
+                mcp_client_wrapper = MCPToolClient(client)
+                logger.info(f"Loaded {len(discovered_tools)} MCP tools")
+            else:
+                logger.warning("No MCP tools discovered")
+        except Exception as e:
+            logger.error(f"MCP tool loading failed: {e}")
+            # Continue without tools
+
+    await agent.initialize(mcp_client=mcp_client_wrapper, tool_definitions=tool_definitions)
+
+    if not await agent.health_check():
+        logger.error(f"Agent health check failed – model {model} not available")
+        agent = None
+    else:
+        logger.info("BusinessAnalystAgent ready")
+
+    yield  # server runs
+
+    # Cleanup: MCP client has no explicit close; it's fine to let it be GC'd
+    agent = None
+
+app = FastAPI(
+    title="Automotive Business Analyst",
+    description="Automotive business analysis with GitHub/Jira MCP tools",
+    lifespan=lifespan,
+)
 
 
-app = FastAPI(title="Automotive Business Analyst", lifespan=lifespan)
-
-
+# ---------- Request/Response Models ----------
 class AnalysisRequest(BaseModel):
     user_input: str
-    github_token: Optional[str] = None   # optional, used when MCP tools are needed
+
+
+class AnalysisResponse(BaseModel):
+    answer: str
+    shield_alert: Optional[str] = None
 
 
 class GitHubConnectRequest(BaseModel):
     pat: str
 
 
-@app.post("/analyze")
-async def analyze_endpoint(request: AnalysisRequest):
-    """
-    Run the business analyst agent on the user’s input.
-    (Optionally receives a GitHub token for future MCP integration.)
-    """
-    if graph is None:
-        raise HTTPException(status_code=503, detail="Service not ready – Bedrock client unavailable")
+class GitHubConnectResponse(BaseModel):
+    username: Optional[str] = None
+    message: Optional[str] = None
 
-    initial_state: BusinessAnalysisState = {
-        "messages": [],
-        "user_input": request.user_input,
-        "analysis_result": "",
-        "final_answer": "",
-        "shield_violation": None,
-        "error": None,
-        # The token can be stored in the state and later forwarded to MCP tools
-        # when we extend the agent to use GitHub/Jira.
-        "github_token": request.github_token,
-    }
+
+class JiraConnectRequest(BaseModel):
+    url: str
+    username: str
+    api_token: str
+
+
+class JiraConnectResponse(BaseModel):
+    account_id: Optional[str] = None
+    display_name: Optional[str] = None
+    message: Optional[str] = None
+
+
+# ---------- Endpoints ----------
+@app.post("/analyze", response_model=AnalysisResponse)
+async def analyze(request: AnalysisRequest):
+    """Run the automotive business analyst on the user's input."""
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Agent not initialised – check Ollama connection")
 
     try:
-        final_state = await graph.ainvoke(initial_state)
-    except GeminiClientError:
-        raise HTTPException(status_code=401, detail="AWS Bedrock token expired. Please refresh.")
+        final_answer = None
+        shield_violation = None
+        async for event in agent.generate(request.user_input):
+            if event.get("type") == "final":
+                final_answer = event.get("content")
+            elif event.get("type") == "error":
+                raise HTTPException(status_code=500, detail=event.get("error"))
+            elif event.get("type") == "progress":
+                # Can be logged or forwarded to a WebSocket if needed
+                logger.debug(f"Progress: {event.get('node')} -> {event.get('state')}")
+        if final_answer is None:
+            final_answer = "No answer generated."
+        return AnalysisResponse(answer=final_answer, shield_alert=shield_violation)
     except Exception as e:
-        logger.exception("Unexpected agent error")
-        raise HTTPException(status_code=500, detail=f"Internal agent error: {e}")
-
-    return {
-        "answer": final_state.get("final_answer", "No answer generated."),
-        "shield_alert": final_state.get("shield_violation"),
-    }
+        logger.exception("Analysis failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/mcp/status")
-async def mcp_status(pat: Optional[str] = Query(None)):
-    """
-    Return Jira / GitHub connection status.
-    - Jira: checks environment variables.
-    - GitHub: if `pat` is provided, validates that token; otherwise uses the
-      default GITHUB_TOKEN from the environment.
-    """
-    # Jira status
+async def mcp_status():
+    """Return connection status of Jira and GitHub (based on environment)."""
     jira_connected = bool(
         os.getenv("JIRA_URL") and
         os.getenv("JIRA_USERNAME") and
         os.getenv("JIRA_API_TOKEN")
     )
+    jira_status = "connected" if jira_connected else "disconnected"
 
-    # GitHub status
-    token_to_check = pat or os.getenv("GITHUB_TOKEN")
+    github_token = os.getenv("GITHUB_TOKEN")
     github_status = "disconnected"
-
-    if token_to_check:
+    if github_token:
         try:
-            resp = requests.get(
-                "https://api.github.com/user",
-                headers={"Authorization": f"token {token_to_check}"},
-                timeout=5,
-            )
-            if resp.status_code == 200:
-                user_data = resp.json()
-                username = user_data.get("login")
-                if username:
-                    github_status = f"connected ({username})"
-        except Exception:
-            logger.warning("GitHub status check failed")
-
-    return {
-        "jira": "connected" if jira_connected else "disconnected",
-        "github": github_status,
-    }
+            async with aiohttp.ClientSession() as session:
+                headers = {"Authorization": f"token {github_token}"}
+                async with session.get("https://api.github.com/user", headers=headers, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        username = data.get("login")
+                        github_status = f"connected ({username})"
+                    else:
+                        github_status = "disconnected"
+        except Exception as e:
+            logger.warning(f"GitHub status check failed: {e}")
+    return {"jira": jira_status, "github": github_status}
 
 
 @app.post("/github/connect")
 async def github_connect(request: GitHubConnectRequest):
-    """
-    Validate a GitHub Personal Access Token and return the associated username.
-    (No server‑side session – the caller is responsible for storing the token.)
-    """
+    """Validate a GitHub personal access token."""
+    if not request.pat:
+        raise HTTPException(status_code=400, detail="PAT required")
     try:
-        resp = requests.get(
-            "https://api.github.com/user",
-            headers={"Authorization": f"token {request.pat}"},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            user_data = resp.json()
-            username = user_data.get("login")
-            if username:
-                return {"username": username, "message": "Token is valid"}
-        raise HTTPException(status_code=401, detail="Invalid GitHub token")
-    except requests.RequestException as e:
-        raise HTTPException(status_code=503, detail=f"GitHub API unreachable: {e}")
+        async with aiohttp.ClientSession() as session:
+            headers = {"Authorization": f"token {request.pat}"}
+            async with session.get("https://api.github.com/user", headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    username = data.get("login")
+                    if username:
+                        return GitHubConnectResponse(username=username)
+                    else:
+                        raise HTTPException(status_code=401, detail="Invalid token")
+                else:
+                    error_text = await resp.text()
+                    raise HTTPException(status_code=resp.status, detail=f"GitHub API error: {error_text}")
+    except aiohttp.ClientError as e:
+        logger.error(f"GitHub connection error: {e}")
+        raise HTTPException(status_code=503, detail=f"GitHub unreachable: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+        logger.exception("Unexpected error in /github/connect")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/jira/connect")
+async def jira_connect(request: JiraConnectRequest):
+    """Validate Jira credentials by calling the Jira API."""
+    if not request.url or not request.username or not request.api_token:
+        raise HTTPException(status_code=400, detail="URL, username, and API token are required")
+
+    base_url = request.url.rstrip('/')
+    myself_url = f"{base_url}/rest/api/2/myself"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            auth = aiohttp.BasicAuth(request.username, request.api_token)
+            async with session.get(myself_url, auth=auth, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    account_id = data.get("accountId")
+                    display_name = data.get("displayName")
+                    return JiraConnectResponse(
+                        account_id=account_id,
+                        display_name=display_name,
+                        message="Connected successfully"
+                    )
+                else:
+                    error_text = await resp.text()
+                    raise HTTPException(status_code=resp.status, detail=f"Jira API error: {error_text}")
+    except aiohttp.ClientError as e:
+        logger.error(f"Jira connection error: {e}")
+        raise HTTPException(status_code=503, detail=f"Jira unreachable: {e}")
+    except Exception as e:
+        logger.exception("Unexpected error in /jira/connect")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    if client is None:
-        raise HTTPException(status_code=503, detail="Llama Stack client not connected")
-    return {"status": "ok"}
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Agent not ready")
+    try:
+        healthy = await agent.health_check()
+        if not healthy:
+            raise HTTPException(status_code=503, detail="Model not available")
+        return {"status": "ok", "model": agent.model}
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        raise HTTPException(status_code=503, detail=str(e))

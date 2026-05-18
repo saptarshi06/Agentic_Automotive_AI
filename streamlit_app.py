@@ -93,7 +93,7 @@ with st.sidebar:
     else:
         st.warning("⚠️ GitHub – Disconnected")
         # Allow user to paste PAT
-        with st.expander("Connect GitHub"):
+    with st.expander("Connect GitHub"):
             pat = st.text_input("GitHub Personal Access Token", type="password")
             if st.button("Connect"):
                 if pat:

@@ -13,7 +13,7 @@ from langchain_core.messages import (
 )
 
 from mcp_engine import MCPEngine
-from common.llm.base_bedrock import BedrockClient
+from common.llm.ollama_client import OllamaClient as BedrockClient
 
 logging.basicConfig(
     level=logging.INFO,
