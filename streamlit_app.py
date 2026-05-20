@@ -1,24 +1,20 @@
 import streamlit as st
 import requests
-import json
 
-# -------------------------------------------------------------------
+
 # Configuration
-# -------------------------------------------------------------------
 API_BASE_URL = "http://localhost:8000"  # FastAPI server address
 
-# -------------------------------------------------------------------
+
 # Session state initialisation
-# -------------------------------------------------------------------
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.username = ""
     st.session_state.email = ""
     st.session_state.messages = []  # chat history
 
-# -------------------------------------------------------------------
+
 # Helper functions to call FastAPI
-# -------------------------------------------------------------------
 def analyze_user_input(user_input: str) -> dict:
     """POST /analyze"""
     resp = requests.post(f"{API_BASE_URL}/analyze", json={"user_input": user_input})
@@ -39,14 +35,11 @@ def connect_github(pat: str) -> dict:
     resp = requests.post(f"{API_BASE_URL}/github/connect", json={"pat": pat})
     return resp.json()  # may contain error message if not 200
 
-# -------------------------------------------------------------------
+
 # UI
-# -------------------------------------------------------------------
 st.set_page_config(page_title="Automotive Business Analyst", layout="wide")
 
-# ------------------------------
 # LOGIN PAGE (if not logged in)
-# ------------------------------
 if not st.session_state.logged_in:
     st.title("Login")
     with st.form("login_form"):
@@ -66,12 +59,10 @@ if not st.session_state.logged_in:
                 st.error("Please fill in all fields.")
     st.stop()
 
-# ------------------------------
 # MAIN APP (after login)
-# ------------------------------
-st.title(f"🚗 Automotive Business Analyst – Welcome, {st.session_state.username}")
+st.title(f"🚗 Automotive Business Analyst - Welcome, {st.session_state.username}")
 
-# --- SIDEBAR ---
+#  SIDEBAR 
 with st.sidebar:
     st.header("MCP Servers")
     # Fetch status from backend
@@ -80,18 +71,18 @@ with st.sidebar:
     # Jira status
     jira_status = mcp_status.get("jira", "disconnected")
     if jira_status == "connected":
-        st.success("✅ Jira – Connected")
+        st.success("✅ Jira - Connected")
     else:
-        st.warning("⚠️ Jira – Disconnected (set JIRA_URL, USERNAME, API_TOKEN)")
+        st.warning("⚠️ Jira - Disconnected (set JIRA_URL, USERNAME, API_TOKEN)")
 
     # GitHub status
     github_status = mcp_status.get("github", "disconnected")
     if github_status.startswith("connected"):
         # Display connected with username
         username = github_status.split("(", 1)[1].rstrip(")")
-        st.success(f"✅ GitHub – Connected to {username}")
+        st.success(f"✅ GitHub - Connected to {username}")
     else:
-        st.warning("⚠️ GitHub – Disconnected")
+        st.warning("⚠️ GitHub - Disconnected")
         # Allow user to paste PAT
     with st.expander("Connect GitHub"):
             pat = st.text_input("GitHub Personal Access Token", type="password")
@@ -110,7 +101,7 @@ with st.sidebar:
                 else:
                     st.warning("Please enter a token.")
 
-# --- CHAT INTERFACE ---
+#  CHAT INTERFACE 
 st.divider()
 
 # Display chat history

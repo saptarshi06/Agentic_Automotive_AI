@@ -1,188 +1,23 @@
-import json
-import logging
-from typing import Dict, Any, List, Optional, AsyncIterator, Union
-from openai import AsyncOpenAI
+import os
+from google.adk.models.lite_llm import LiteLlm
 
-# Llama Stack safety imports (exact models you provided)
-from llama_stack_api.safety.api import RunShieldRequest, RunModerationRequest
-# The actual async client (must be installed)
-from llama_stack_client import AsyncLlamaStackClient
-
-logger = logging.getLogger(__name__)
-
-
-class OllamaClientError(Exception):
-    """Base exception for Ollama client errors."""
-    pass
-
-
-class OllamaClient:
+def get_ollama_model(model_name: str = "gemma3:12b"):
     """
-    Base client for Ollama using the OpenAI-compatible API.
-    Integrates Llama Stack safety shields (run_moderation, run_shield)
-    and provides placeholders for MCP tools.
+    Initializes and returns a LiteLlm model instance configured for Ollama.
+    It uses the 'openai/' prefix to bypass compatibility issues.
     """
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL")
 
-    def __init__(
-        self,
-        ollama_base_url: str = "http://localhost:11434/v1",
-        model: str = "phi3.5:latest",
-        ollama_api_key: str = "ollama",
-        timeout: float = 60.0,
-        # Llama Stack configuration (optional)
-        llama_stack_base_url: str = "http://localhost:8321",
-        llama_stack_provider_data: Optional[Dict[str, Any]] = None,
-    ):
-        # Ollama client
-        self.ollama_base_url = ollama_base_url
-        self.model = model
-        self.ollama_client = AsyncOpenAI(
-            base_url=ollama_base_url,
-            api_key=ollama_api_key,
-            timeout=timeout,
-        )
-        # MCP client placeholder (to be injected later)
-        self.mcp_client = None
+    # The 'openai/' prefix tells LiteLlm to use the OpenAI-compatible endpoint
+    # To use a specific Ollama model, e.g., 'openai/llama3'
+    full_model_path = f"openai/{model_name}"
 
-        # Llama Stack safety client (if configured)
-        self.safety_client = None
-        if llama_stack_base_url:
-            self.safety_client = AsyncLlamaStackClient(
-                base_url=llama_stack_base_url,
-                provider_data=llama_stack_provider_data or {},
-            )
-            logger.info(f"Llama Stack safety client configured at {llama_stack_base_url}")
-        else:
-            logger.info("No Llama Stack URL provided – safety will use stubs.")
+    return LiteLlm(
+        model=full_model_path,
+        api_base=OLLAMA_BASE_URL,
+    )
 
-    async def initialize(self, mcp_client=None) -> None:
-        """Initialize any required resources (e.g., MCP connection)."""
-        self.mcp_client = mcp_client
-        logger.info(f"OllamaClient initialized with model {self.model}")
 
-    async def generate_non_streaming(
-        self,
-        messages: List[Dict[str, str]],
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-        tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: str = "auto",
-    ) -> Dict[str, Any]:
-        """Non‑streaming generation via Ollama. Returns dict with 'type', 'content', 'tool_calls'."""
-        try:
-            response = await self.ollama_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=False,
-                tools=tools or [],
-                tool_choice=tool_choice,
-            )
-            message = response.choices[0].message
-            return {
-                "type": "complete",
-                "content": message.content or "",
-                "tool_calls": message.tool_calls if hasattr(message, "tool_calls") else [],
-            }
-        except Exception as e:
-            logger.error(f"Ollama generation error: {e}")
-            return {"type": "error", "error": str(e)}
-
-    async def generate_streaming(
-        self,
-        messages: List[Dict[str, str]],
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-    ) -> AsyncIterator[str]:
-        """Streaming generation via Ollama. Yields content chunks."""
-        try:
-            stream = await self.ollama_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
-                tools=[],
-            )
-            async for chunk in stream:
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    yield delta.content
-        except Exception as e:
-            logger.error(f"Streaming error: {e}")
-            yield f"[Error: {e}]"
-
-    async def health_check(self) -> bool:
-        """Verify that Ollama is reachable and the model exists."""
-        try:
-            response = await self.ollama_client.models.list()
-            models = [model.id for model in response.data]
-            return self.model in models
-        except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            return False
-
-    # Real Llama Stack safety integration (using the exact request models)
-    async def run_moderation(self, input_text: Union[str, List[str]]) -> Any:
-        """
-        Run content moderation using the Llama Stack safety API.
-        If no safety client is configured, returns a safe (unflagged) stub.
-        """
-        if self.safety_client is None:
-            logger.debug("No safety client – moderation stub returning safe.")
-            class ModerationResult:
-                flagged = False
-            return ModerationResult()
-
-        try:
-            request = RunModerationRequest(input=input_text)
-            result = await self.safety_client.safety.run_moderation(request)
-            return result
-        except Exception as e:
-            logger.error(f"Moderation API call failed: {e}")
-            # Fallback: allow the request (conservative)
-            class SafeResult:
-                flagged = False
-            return SafeResult()
-
-    async def run_shield(self, shield_id: str, messages: List[Dict[str, str]]) -> Any:
-        """
-        Run a safety shield using the Llama Stack API.
-        If no safety client is configured, returns a no‑violation stub.
-        """
-        if self.safety_client is None:
-            logger.debug(f"No safety client – shield '{shield_id}' stub returning no violation.")
-            class ShieldResult:
-                violation = None
-            return ShieldResult()
-
-        try:
-            # Convert messages to the required OpenAIMessageParam format
-            request = RunShieldRequest(shield_id=shield_id, messages=messages)
-            result = await self.safety_client.safety.run_shield(request)
-            return result
-        except Exception as e:
-            logger.error(f"Shield '{shield_id}' call failed: {e}")
-            # Fallback: no violation
-            class SafeShieldResult:
-                violation = None
-            return SafeShieldResult()
-
-    # MCP tool integration placeholder
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
-        """
-        Call an MCP tool (GitHub, Jira, etc.) via the injected mcp_client.
-        """
-        if self.mcp_client is None:
-            logger.warning(f"MCP tool '{tool_name}' called but no MCP client set.")
-            return {"status": "error", "message": "MCP client not initialized"}
-        try:
-            # Assumes mcp_client has a call_tool method (adjust as needed)
-            return await self.mcp_client.call_tool(tool_name, arguments)
-        except Exception as e:
-            logger.error(f"Tool call failed: {e}")
-            return {"status": "error", "message": str(e)}
 
 
 # import asyncio

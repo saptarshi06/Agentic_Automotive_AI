@@ -1,0 +1,5 @@
+google-adk
+langgraph
+streamlit
+fastapi
+google_adk[extensions]
