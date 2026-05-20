@@ -12,7 +12,7 @@ def create_ba_agent():
 
     business_analyst_agent = LlmAgent(
         name="business_analyst_agent",
-        model=get_ollama_model("llama3.2"),
+        model=get_ollama_model("gemma3:12b"),
         instruction="""
         You are a helpful, AI-powered business analyst assistant.
 

@@ -1,7 +1,7 @@
 import os
 from google.adk.models.lite_llm import LiteLlm
 
-def get_ollama_model(model_name: str = "gemma3:12b"):
+def get_ollama_model(model_name: str) -> LiteLlm:
     """
     Initializes and returns a LiteLlm model instance configured for Ollama.
     It uses the 'openai/' prefix to bypass compatibility issues.
@@ -10,7 +10,7 @@ def get_ollama_model(model_name: str = "gemma3:12b"):
 
     # The 'openai/' prefix tells LiteLlm to use the OpenAI-compatible endpoint
     # To use a specific Ollama model, e.g., 'openai/llama3'
-    full_model_path = f"openai/{model_name}"
+    full_model_path = f"ollama/{model_name}"
 
     return LiteLlm(
         model=full_model_path,
